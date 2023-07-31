@@ -1,0 +1,2318 @@
+app.py
+""We connect backend with flask""
+
+import os
+import sqlite3
+from flask import Flask, flash, render_template, redirect, session, url_for, g
+from flask.globals import request
+from werkzeug.utils import secure_filename
+from Asummary import load_model_and_tokenizer, summarize_text as summarize_pegasus
+from Esummary import load_model, summarize_text as summarize_summarizer
+from mcq import MCQs
+import re
+from qa import QAEvaluator,QuestionGenerator
+
+#constants
+questionLength = 0
+text=""
+
+app = Flask(__name__)
+
+currentLocation = os.path.dirname(os.path.abspath(__file__))
+app.secret_key = 'MYINTELLIQ'
+pegasus_model, pegasus_tokenizer = load_model_and_tokenizer('model.pkl')
+summarizer_model = load_model('summarizer_model.pkl')
+
+@app.route('/dropsession')
+def dropsession():
+    session.pop('user', None)
+    return redirect('/')
+
+
+@app.before_request
+def before_request():
+    g.user = None
+    if 'user' in session:
+        g.user = session['user']
+
+@ app.route('/')
+def index():
+    """ The landing page for the app from scratch """
+    return render_template('index.html')
+
+
+@ app.route('/signin')
+def signin():
+    return render_template('signin.html')
+
+@ app.route('/signin', methods=['POST'])
+def checklogin():
+    UN = request.form['Username']
+    PW = request.form['Password']
+
+    sqlconnection = sqlite3.Connection(currentLocation+"\\Login.db")
+    cursor = sqlconnection.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS Users(Username text, Password text);")
+    sqlconnection.commit()
+    query1 = "SELECT Username, Password from Users WHERE Username = '{un}' AND Password = '{pw}'".format(un = UN, pw = PW)
+
+    rows = cursor.execute(query1)
+    rows = rows.fetchall()
+    if len(rows) == 1:
+        if request.method == 'POST':
+            session.pop('user', None)
+            
+            if request.form['Password'] == PW:
+                session['user'] = request.form['Username']
+                return redirect('/upload')
+
+
+    else:
+        flash("Wrong Details")
+    return render_template('signin.html')
+
+
+@ app.route('/signup', methods=['GET','POST'])
+def registerpage():
+    if request.method == "POST":
+        dUN = request.form['DUsername']
+        dPW = request.form['DPassword']
+        cPW = request.form['confPw']
+        sqlconnection = sqlite3.Connection(currentLocation+"\\Login.db")
+        cursor = sqlconnection.cursor()
+        try:
+            if cPW == dPW:
+                checkUser = "SELECT Username, Password from Users WHERE Username = '{dun}' AND Password = '{dpw}'".format(dun = dUN, dpw = dPW)
+                rows = cursor.execute(checkUser)
+                rows = rows.fetchall()
+                if len(rows) == 1:
+                    flash("Account Already Exists")
+                else:
+                    query1 = "INSERT INTO Users VALUES('{u}','{p}')".format(u = dUN, p = dPW)
+                    cursor.execute(query1)
+                    sqlconnection.commit()
+                    flash("🎉 Awesome! Account created, now log in to your account!")
+                    return redirect('/signin')
+            else:
+                flash("Both Passwords are Mismatch")
+                return render_template('signup.html')
+        except:
+            flash("Something went Wrong, try again later!")
+            return render_template('signup.html')
+    return render_template('signup.html')
+
+@ app.route('/upload')
+def upload():
+    if g.user:
+        return render_template('upload.html')
+    return render_template('unauthorized.html')
+
+@ app.route('/quiz', methods=['GET', 'POST'])
+def quiz():
+    global text
+    text = request.form['input-text']
+    return render_template(
+        'quiz.html')
+
+
+
+@app.route('/ab_summary', methods=['POST'])
+def ab_summary():
+    global text
+    summary = summarize_pegasus(text, pegasus_model, pegasus_tokenizer)
+    summary = summary.replace("<pad>", "").replace("</s>", "")
+    return render_template('ab_summary.html', text=text, summary=summary)
+
+@app.route('/ex_summary', methods=['POST'])
+def ex_summary():
+    global text
+    summary = summarize_summarizer(text, summarizer_model)
+    return render_template('ex_summary.html', text=text, summary=summary)
+
+@app.route('/qaa', methods=['POST'])
+def qaa():
+    global text
+    x = request.form['myNumber']
+    y=int(x)
+    generator = QuestionGenerator()
+    question = generator.generate(text,num_questions=y)
+    return render_template('qaa.html', text=text, question=question)
+
+
+@app.route('/mq', methods=['POST'])
+def mq():
+    global text
+    mcq=MCQs(text)
+    return render_template('mq.html', text=text, mcq=mcq)
+
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
+
+Asummary.py
+"""Abstractive Summarization"""
+
+
+import pickle
+from transformers import PegasusForConditionalGeneration, PegasusTokenizer
+
+def save_model_and_tokenizer(model, tokenizer, file_name):
+    with open(file_name, 'wb') as f:
+        pickle.dump((model, tokenizer), f)
+
+def load_model_and_tokenizer(file_name):
+    with open(file_name, 'rb') as f:
+        model, tokenizer = pickle.load(f)
+    return model, tokenizer
+
+def summarize_text(text, model, tokenizer):
+    tokens = tokenizer(text, truncation=True, padding="longest", return_tensors="pt")
+    summary = model.generate(**tokens)
+    return tokenizer.decode(summary[0])
+
+if __name__ == '__main__':
+    tokenizer = PegasusTokenizer.from_pretrained("google/pegasus-xsum")
+    model = PegasusForConditionalGeneration.from_pretrained("google/pegasus-xsum")
+    save_model_and_tokenizer(model, tokenizer, 'model.pkl')
+
+
+
+Esummary.py
+"""Extractive Summarization"""
+
+import pickle
+from summarizer import Summarizer
+
+def save_model(model, file_name):
+    with open(file_name, 'wb') as f:
+        pickle.dump(model, f)
+
+def load_model(file_name):
+    with open(file_name, 'rb') as f:
+        model = pickle.load(f)
+    return model
+
+def summarize_text(text, model):
+    result = model(text, ratio=0.5)
+    summarized_text = ''.join(result)
+    return summarized_text
+
+if __name__ == '__main__':
+    model = Summarizer()
+    save_model(model, 'summarizer_model.pkl')
+
+Keywords_Extraction.py
+"""For MCQs"""
+import nltk
+import pprint
+import itertools
+import re
+import pke
+import string
+
+def keywords_from_input(g_input):
+    store=[]
+    reciver = pke.unsupervised.MultipartiteRank()
+    reciver.load_document(input=g_input)
+    pos = {'PROPN'}
+    reciver.candidate_selection(pos=pos)
+    reciver.candidate_weighting()
+    store_key = reciver.get_n_best(n=20)
+
+    for item in store_key:
+        store.append(item[0])
+
+    return store
+
+def final_keyword(text,summary):
+    kw = keywords_from_input(text) 
+    final_keywords=[]
+    for k in kw:
+        if k.lower() in summary.lower():
+            final_keywords.append(k)
+    return final_keywords
+
+Sentence_Mapping.py
+"""Keywords_Sentence_Mappin for MCQs"""
+
+from nltk.tokenize import sent_tokenize
+from flashtext import KeywordProcessor
+
+def context_input(g_input):
+    context = [sent_tokenize(g_input)]
+    context = [y for x in context for y in x]
+    context = [f.strip() for f in context if len(f) > 15]
+    return context
+
+def context_kw(kw, contexts):
+    kwp = KeywordProcessor()
+    kws = {}
+    for x in kw:
+        kws[x] = []
+        kwp.add_keyword(x)
+    for context in contexts:
+        kwf = kwp.extract_keywords(context)
+        for x in kwf:
+            kws[x].append(context)
+
+    for y in kws.keys():
+        v = kws[y]
+        v = sorted(v, key=len, reverse=True)
+        kws[y] = v
+    return kws
+
+distractors.py
+"""Distractors For MCQs"""
+
+
+import requests
+import json
+import re
+import random
+from pywsd.similarity import max_similarity as mxs
+from pywsd.lesk import adapted_lesk as adl
+from pywsd.lesk import simple_lesk
+from pywsd.lesk import cosine_lesk
+from nltk.corpus import wordnet as wn
+
+
+def gdw(x,text):
+
+    options_=[]
+
+    text= text.lower()
+
+    given_text = text
+
+    if len(text.split())>0:
+
+        text = text.replace(" ","_")
+    hy = getattr(x, "hypernyms")()
+    if not hy: 
+
+        return options_
+    
+    xy=getattr(hy[0], "hyponyms")()
+
+    for x in xy:
+        name = x.lemmas()[0].name()
+        if name == given_text:
+            continue
+        name = ' '.join(word.capitalize() for word in name.replace("_", " ").split())
+
+        if name is not None:
+            if name not in options_:
+                options_.append(name)
+    return options_
+
+
+
+def gws(s,text):
+    text= text.lower()
+    x=  len(text.split())
+    if x>0:
+
+        text = text.replace(" ","_")
+    
+    
+    sy = wn.synsets(text,'n')
+    if sy:
+        wup = mxs(s, text, 'wup', pos='n')
+        adlo =  adl(s, text, pos='n')
+        lowest_index = min (sy.index(wup),sy.index(adlo))
+        return sy[lowest_index]
+    else:
+        return None
+
+def gdc(text):
+    text = text.lower()
+    ow= text
+    if (len(text.split())>0):
+        text = text.replace(" ","_")
+    dl = [] 
+    url = "http://api.conceptnet.io/query?node=/c/en/%s/n&rel=/r/PartOf&start=/c/en/%s&limit=5"%(text,text)
+    obj = requests.get(url).json()
+
+    for edge in obj['edges']:
+        l = edge['end']['term'] 
+
+        url2 = "http://api.conceptnet.io/query?node=%s&rel=/r/PartOf&end=%s&limit=10"%(l,l)
+        obj2 = requests.get(url2).json()
+        for edge in obj2['edges']:
+            text2 = edge['start']['label']
+            if text2 not in dl and ow.lower() not in text2.lower():
+                dl.append(text2)
+                   
+    return dl
+
+def gdo(ksm):
+    kdl = {}
+
+    for k in ksm:
+        s = ksm[k]
+        d = []
+        for sent in s:
+            wds = gws(sent, k)
+            if wds:
+                dt = gdw(wds, k)
+                if len(dt) == 0:
+                    dt = gdc(k)
+                d.extend(dt)
+            else:
+                dt = gdc(k)
+                d.extend(dt)
+        if len(d) != 0:
+            kdl[k] = d
+
+    return kdl
+
+mcq.py
+"""MCQs Gneration"""
+from keywords_extraction import final_keyword,keywords_from_input
+from sentence_mapping import context_input,context_kw
+from distractors import gdc,gdo,gdw,gws
+from Esummary import load_model, summarize_text
+import nltk
+import pprint
+import itertools
+import re
+import pke
+import string
+from nltk.corpus import stopwords
+from summarizer import Summarizer
+from nltk.tokenize import sent_tokenize
+from flashtext import KeywordProcessor
+import requests
+import json
+import re
+import random
+from pywsd.similarity import max_similarity
+from pywsd.lesk import adapted_lesk
+from pywsd.lesk import simple_lesk
+from pywsd.lesk import cosine_lesk
+from nltk.corpus import wordnet as wn
+
+
+summarizer_model = load_model('summarizer_model.pkl')
+def MCQs(text):
+    summarizer_model = load_model('summarizer_model2.pkl')
+    summary = summarize_text(text, summarizer_model)
+
+    filtered_keys=final_keyword(text,summary)
+    sentences = context_input(summary)
+    keyword_sentence_mapping = context_kw(filtered_keys, sentences)
+
+    key_distractor_list = gdo(keyword_sentence_mapping)
+
+    mcq_list = []
+    index = 1
+    for each in key_distractor_list:
+        sentences = keyword_sentence_mapping[each]
+        pattern = re.compile(each, re.IGNORECASE)
+        for sentence in sentences:
+            output = pattern.sub(" _______ ", sentence)
+            mcq_list.append("%s) %s" % (index, output))
+            choices = [each.capitalize()] + key_distractor_list[each]
+            top4choices = choices[:4]
+            random.shuffle(top4choices)
+            optionchoices = ['a', 'b', 'c', 'd']
+            correct_answer = optionchoices[top4choices.index(each.capitalize())]
+            for idx, choice in enumerate(top4choices):
+                mcq_list.append("\t%s) %s" % (optionchoices[idx], choice))
+            mcq_list.append("\tCorrect Answer: %s) %s" % (correct_answer, each.capitalize()))
+            index += 1
+
+    return mcq_list
+
+
+
+qa.py
+"""Question and Answers Generation"""
+
+import en_core_web_sm
+import json
+import numpy as np
+import random
+import re
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForSequenceClassification,
+)
+from typing import Any, List, Mapping, Tuple
+
+
+def initialize_qg():
+    qpre = "iarfmoose/t5-base-question-generator"
+    AT = "<answer>"
+    CT = "<context>"
+    SL = 512
+
+    SYS = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    QAT = AutoTokenizer.from_pretrained(qpre, use_fast=False)
+    QAMODEL = AutoModelForSeq2SeqLM.from_pretrained(qpre)
+    QAMODEL.to(SYS)
+    QAMODEL.eval()
+
+    return QAT, QAMODEL, SYS
+
+
+def initialize_qa():
+    QAE_PRETRAINED = "iarfmoose/bert-base-cased-qa-evaluator"
+    SL = 512
+
+    SYS = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    QET = AutoTokenizer.from_pretrained(QAE_PRETRAINED)
+    QEMODEL = AutoModelForSequenceClassification.from_pretrained(QAE_PRETRAINED)
+    QEMODEL.to(SYS)
+    QEMODEL.eval()
+
+    return QET, QEMODEL, SYS
+
+
+def split_sentences(INPUT_T):
+    MAX_SENTENCE_LEN = 128
+    CONTECT = re.findall(".*?[.!\?]", INPUT_T)
+    cut_sentences = []
+
+    for sentence in CONTECT:
+        if len(sentence) > MAX_SENTENCE_LEN:
+            cut_sentences.extend(re.split("[,;:)]", sentence))
+
+    cut_sentences = [s for s in CONTECT if len(s.split(" ")) > 5]
+    CONTECT = CONTECT + cut_sentences
+
+    return list(set([s.strip(" ") for s in CONTECT]))
+
+
+def split_text_into_segments(text, QAT):
+    MAX_TOKENS = 490
+    PARA = text.split("\n")
+    T_PARA = [
+        QAT(p)["input_ids"] for p in PARA if len(p) > 0
+    ]
+    SS = []
+
+    while len(T_PARA) > 0:
+        S = []
+
+        while len(S) < MAX_TOKENS and len(T_PARA) > 0:
+            paragraph = T_PARA.pop(0)
+            S.extend(paragraph)
+        SS.append(S)
+
+    return [QAT.decode(s, skip_special_tokens=True) for s in SS]
+
+
+def prepare_qg_input(S, text, AT, CT):
+    IN = []
+    OUT = []
+
+    for X in S:
+        XX = f"{AT} {X} {CT} {text}"
+        IN.append(XX)
+        OUT.append(X)
+
+    return IN, OUT
+
+
+def generate_questions_from_input(QIN, QAT, QAMODEL, SYS):
+    generated_questions = []
+
+    for XX in QIN:
+        question = generate_question_from_input(XX, QAT, QAMODEL, SYS)
+        generated_questions.append(question)
+
+    return generated_questions
+
+
+@torch.no_grad()
+def generate_question_from_input(qg_input, QAT, QAMODEL, SYS):
+    encoded_input = encode_qg_input(qg_input, QAT, SYS)
+    output = QAMODEL.generate(input_ids=encoded_input["input_ids"])
+    question = QAT.decode(output[0], skip_special_tokens=True)
+    return question
+
+
+def encode_qg_input(qg_input, QAT, SYS):
+    SL = 512
+    return QAT(
+        qg_input,
+        padding='max_length',
+        max_length=SL,
+        truncation=True,
+        return_tensors="pt",
+    ).to(SYS)
+
+
+def encode_qa_pairs(questions, answers, QET):
+    encoded_pairs = []
+
+    for question, answer in zip(questions, answers):
+        encoded_qa = encode_qa_pair(question, answer, QET)
+        encoded_pairs.append(encoded_qa)
+
+    return encoded_pairs
+
+
+def encode_qa_pair(question, answer, QET):
+    SL = 512
+    return QET(
+        text=question,
+        text_pair=answer,
+        padding="max_length",
+        max_length=SL,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+
+@torch.no_grad()
+def evaluate_qa_pair(encoded_qa_pair, QEMODEL, SYS):
+    output = QEMODEL(**encoded_qa_pair.to(SYS))
+    return output[0][0][1]
+
+
+def get_qa_scores(encoded_qa_pairs, QEMODEL, SYS):
+    scores = {}
+
+    for i in range(len(encoded_qa_pairs)):
+        scores[i] = evaluate_qa_pair(encoded_qa_pairs[i], QEMODEL, SYS)
+
+    return [
+        k for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+
+def get_ranked_qa_pairs(generated_questions, qg_answers, scores, num_questions=10):
+    if num_questions > len(scores):
+        num_questions = len(scores)
+        print("Was only able to generate {} questions. For more questions, please input a longer text.".format(num_questions))
+
+    qa_list = []
+
+    for i in range(num_questions):
+        index = scores[i]
+        qa = {
+            "question": generated_questions[index].split("?")[0] + "?",
+            "answer": qg_answers[index]
+        }
+        qa_list.append(qa)
+
+    return qa_list
+
+
+def get_all_qa_pairs_data(generated_questions, qg_answers):
+    qa_list = []
+
+    for question, answer in zip(generated_questions, qg_answers):
+        qa = {
+            "question": question.split("?")[0] + "?",
+            "answer": answer
+        }
+        qa_list.append(qa)
+
+    return qa_list
+
+
+def generate_questions(article, use_evaluator=True, num_questions=None):
+    print("Generating questions...\n")
+
+    QAT, QAMODEL, qg_SYS = initialize_qg()
+    QET, QEMODEL, qae_SYS = initialize_qa()
+
+    qg_inputs, qg_answers = prepare_qg_input(split_sentences(article), article, "<answer>", "<context>")
+    generated_questions = generate_questions_from_input(qg_inputs, QAT, QAMODEL, qg_SYS)
+
+    message = "{} questions doesn't match {} answers".format(
+        len(generated_questions), len(qg_answers)
+    )
+    assert len(generated_questions) == len(qg_answers), message
+
+    if use_evaluator:
+        print("Evaluating QA pairs...\n")
+        encoded_qa_pairs = encode_qa_pairs(generated_questions, qg_answers, QET)
+        scores = get_qa_scores(encoded_qa_pairs, QEMODEL, qae_SYS)
+
+        if num_questions:
+            qa_list = get_ranked_qa_pairs(generated_questions, qg_answers, scores, num_questions)
+        else:
+            qa_list = get_ranked_qa_pairs(generated_questions, qg_answers, scores)
+
+    else:
+        print("Skipping evaluation step.\n")
+        qa_list = get_all_qa_pairs_data(generated_questions, qg_answers)
+
+    return qa_list
+
+
+Index.html
+"""Intialize page for Front End"""
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <link rel="stylesheet" type="text/css" href="../static/css/index.css">
+    <title>My Intelli-Q | Home</title>
+</head>
+
+<body>
+    <main>
+        <div class="text-center">
+            <img width="190px" src="../static/assets/logoWhite.png">
+        </div>
+
+        <article>
+
+            <div class="illustration">
+                <div class="fadein">
+                    <img src="../static/assets/upload1.svg">
+                </div>
+            </div>
+
+            <div class="content">
+
+                <h1>Discover the Unseen Depths of the Text!</h1>
+
+                <p>Generates a Multiple Features like Summarization, MCQs, Question and Answers  from any uploaded text using NLP. This can be used for
+                    self-analysis, question paper generation, concise the text, thus reducing human effort.</p>
+                <a href=signin><button>Get Started</button></a>
+            </div>
+
+        </article>
+
+    </main>
+</body>
+
+</html>
+
+Signin.html
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <link rel="stylesheet" type="text/css" href="../static/css/signin.css">
+    <title>My Intelli-Q | Login</title>
+</head>
+
+
+<body>
+    <div class="login-box">
+        <div class="login-box-formbox">
+            <div class="login-box-login">
+                <h1>Login to My Intelli-Q</h1>
+                <p>
+                    Signin using your Registered Credentials
+                </p>
+                {% for message in get_flashed_messages() %}
+                {% if message.find('Awesome') != -1%}
+                    <div class="alert alert-success" role="alert">
+                        {{message}}
+                    </div>
+                {% else %}
+                    <div class="alert alert-danger" role="alert">
+                        {{message}}
+                    </div>
+                {% endif %}
+                {% endfor %}
+                <form method="POST">
+                    <div>
+                        <label for="email"> E-Mail</label>
+                        <input type="email" name="Username" class="input-email" autofocus/>
+                    </div>
+                    <div>
+                        <label for="password"> Password</label>
+                        <input type="password" name="Password" class="input-password" id="loginpw" />
+                    </div>
+                    <input type="checkbox" onclick="showPw()"> Show Password
+                    <div>
+                        <input type="submit" value="Login to account" class="btn" />
+                    </div>
+                </form>
+                <div class="login-box-signup text-center">
+                    Don't have an account? <a href=signup>Sign Up</a>
+                </div>
+            </div>
+        </div>
+        <div class="login-box-quotebox">
+            <div class="quote-container">
+                <img src="../static/assets/login.svg" alt="loginVector">
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>
+
+
+singup.html
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <link rel="stylesheet" type="text/css" href="../static/css/signup.css">
+    <title>My Intelli-Q | Signup</title>
+</head>
+
+<body>
+    <div class="login-box">
+        <div class="login-box-formbox">
+            <div class="login-box-login">
+                <h1>Sign Up. It's free and always will be.</h1>
+                <p>
+                    Sign up to My Intelli-Q using your E-mail ID and Password to get started!
+                </p>
+                {% for message in get_flashed_messages() %}
+                    <div class="alert alert-danger" role="alert">
+                        {{message}}
+                    </div>
+                {% endfor %}
+                <form method="POST">
+                    <div>
+                        <label for="email"> E-Mail</label>
+                        <input type="email" name="DUsername" class="input-email" autofocus/>
+                    </div>
+                    <div>
+                        <label for="password"> Password</label>
+                        <input type="password" name="DPassword" class="input-password" id="signuppw" />
+                    </div>
+                    <div>
+                        <label for="password"> Confirm Password</label>
+                        <input type="password" name="confPw" class="input-password" id="confirmpw" />
+                    </div>
+                    <input type="checkbox" onclick="showPw()"> Show Password
+                    <div>
+                        <input type="submit" value="Create account" class="btn" />
+                    </div>
+                </form>
+                <div class="login-box-signup text-center">
+                    Already have an account? <a href=signin>Sign In</a>
+                </div>
+            </div>
+        </div>
+        <div class="login-box-quotebox">
+            <div class="quote-container">
+                <img src="../static/assets/signup.svg" alt="sigupVector">
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>
+
+Upload.html
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/upload.css">
+    <title>My Intelli-Q | Upload</title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a href=dropsession class="nav-link" ><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong>Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    <div class="container mt-3" id="content">
+        <div class="row">
+            <div class="col-md-5 mx-auto">
+                <div class="col-md-12 text-center">
+                    <h3>Enter Text</h3>
+                </div>
+                <div class="alert alert-warning" id="upload-message" role="alert" style="display: none;">
+                    <p>⌛ Please wait while we generate your quiz, this might take few minutes.</p>
+                </div>
+                <div class="wrapper">
+                    <div class="container">
+                        <div class="upload-container">
+                            <div class="border-container">
+                                <link href='https://fonts.googleapis.com/css?family=Ubuntu:300,400' rel='stylesheet' type='text/css'>
+                                <div ng-app="myApp">
+                                <div ng-controller="AppCtrl" align="center">
+                                    
+                                <form action="/quiz" method="POST" >
+                                <textarea id="input-text" name="input-text"  ng-model="loremIpsum" ng-keyup="autoExpand($event)" >
+                                </textarea>
+                                  </div>
+                                </div>
+                                    
+                                
+                                
+                                    
+
+                                    <button class="submitDoc mt-4" type="submit" name="upload file">Upload
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+
+</html>
+
+
+quiz.html
+"""Consits of Features""
+<html lang="en">
+
+<head>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/quiz.css">
+    <title>My Intelli-Q | Features </title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href=dropsession><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong> Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    <div class="container mt-3" id="content">
+        <div class="row">
+            <div class="col-md-5 mx-auto">
+                <div class="col-md-12 text-center">
+                    <h1>Choose Options</h1>
+                </div>
+                <div class="wrapper">
+                    <div class="container">
+                        <div class="upload-container">
+                          <h3>Abstractive Summarization</h3>
+                                <form action="/ab_summary" method="POST" enctype="multipart/form-data"><button class="submitDoc mt-4" type="submit" name="upload file"> Generate</button><br><h1> </h1>
+                                   
+                                </form>
+                        </div>
+                    </div>
+                </div>
+              <div class="wrapper">
+                    <div class="container">
+                        <div class="upload-container">
+                          <h3>Extracive Summarization</h3>
+                                <form action="/ex_summary" method="POST" enctype="multipart/form-data"><button class="submitDoc mt-4" type="submit" name="upload file">Generate </button><br><h1> </h1>
+                                   
+                                </form>
+                        </div>
+                    </div>
+                </div>
+                <div class="wrapper">
+                    <div class="container">
+                        <div class="upload-container">
+                                <link href='https://fonts.googleapis.com/css?family=Ubuntu:300,400' rel='stylesheet' type='text/css'>
+                                
+                                <form action="/qaa" method="POST" enctype="multipart/form-data"><h3>Questions and Answers</h3>
+                                  <input type="number" id="myNumber" id="myNumber" name="myNumber" 
+                value="5"><br>
+                                    <button class="submitDoc mt-4" type="submit" name="upload file">Generate</button>
+                                </form>
+                            
+                        </div>
+                    </div>
+                </div>
+              <div class="wrapper">
+                    <div class="container">
+                        <div class="upload-container">
+                                <link href='https://fonts.googleapis.com/css?family=Ubuntu:300,400' rel='stylesheet' type='text/css'>
+                                
+                                <form action="/mq" method="POST" enctype="multipart/form-data"><h3>MCQ'S</h3>
+                                    <button class="submitDoc mt-4" type="submit" name="upload file">Generate</button>
+                                </form>
+                            
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>
+
+
+ab_summary.html
+
+<html lang="en">
+
+<head>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/summary.css">
+    <title>My Intelli-Q | Summary </title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href=dropsession><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong> Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    
+    <h1 style="text-align: center; color: #fff;" ><b>Abstractive Summarization</b></h1>
+    <div class="container mt-3" id="content">
+        <div class="row">
+                <div class="col-md-12 text-center">
+                    <h5 style="text-align: left;"><b>Original Text: </b></h5>
+        <p style="text-align: left;">{{ text }}</p>
+        <h5   style="text-align: left;"> <b>Summary:</b></h5>
+        <p style="text-align: left;" >{{ summary }}</p>
+                </div>
+              
+            </div>
+        
+    </div>
+</body>
+
+</html>
+
+ex_summary.html
+
+<html lang="en">
+
+<head>
+    
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/summary.css">
+    <title>My Intelli-Q | Summary </title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href=dropsession><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong> Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    <h1 style="text-align: center; color: #fff;"><b>Extractive Summarization</b></h1>
+    <div class="container mt-3" id="content">
+        <div class="row">
+                <div class="col-md-12 text-center">
+                    
+                    <h5 style="text-align: left;"><b>Original Text:</b></h5>
+        <p style="text-align: left;">{{ text }}</p>
+        <h5   style="text-align: left;"><b>Summary:</b></h5>
+        <p style="text-align: left;" >{{ summary }}</p>
+                </div>
+            
+        </div>
+    </div>
+</body>
+
+</html>
+
+
+mcq.html
+<html lang="en">
+
+<head>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/summary.css">
+    <title>My Intelli-Q | MCQs </title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href=dropsession><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong> Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    <h1 style="text-align: center; color: #fff;"><b>Multiple Choice Questions</b> </h1>
+    <div class="container mt-3" id="content">
+        <div class="row">
+                <div class="col-md-12 text-center">
+                    
+                    <h5 style="text-align: left;"><b>Original Text:</b></h5>
+        <p style="text-align: left;">{{ text }}</p>
+        <h5   style="text-align: left;"><b>MCQs:</b></h5>
+
+        <div style="text-align: left;">
+            {% for item in mcq %}
+        {% if loop.index % 6 == 1 %}
+        <div class="question">
+            {{ item }}
+        </div>
+        {% else %}
+            {% if loop.index % 6 == 0 %}
+            <div class="correct-answer">
+                <b>{{ item }}</b>
+            </div>
+            {% else %}
+            <div class="option">
+                {{ item }}
+            </div>
+            {% endif %}
+        {% endif %}
+        {% endfor %}
+        </div>
+                </div>
+              
+            </div>
+        
+    </div>
+</body>
+
+</html>
+
+qaa.html
+
+<html lang="en">
+
+<head>
+    
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-BmbxuPwQa2lc/FVzBcNJ7UAyJxM6wuqIj61tLrc4wSX0szH/Ev+nYRRuWlolflfl" crossorigin="anonymous">
+    <link rel="manifest" href="../static/assets/favicons/site.webmanifest">
+    <link rel="stylesheet" type="text/css" href="../static/css/summary.css">
+    <title>My Intelli-Q | QNA</title>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <a class="navbar-brand" href="/"><img width="150px" src="../static/assets/logoWhite.png" alt="navbarLogo"></a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+            aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon">
+                <i class="fas fa-bars" style="color:#fff; font-size:28px;"></i>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href=dropsession><svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px"
+                            width="26" height="26" viewBox="0 0 172 172" style=" fill:#000000;">
+                            <g fill="none" fill-rule="nonzero" stroke="none" stroke-width="1" stroke-linecap="butt"
+                                stroke-linejoin="miter" stroke-miterlimit="10" stroke-dasharray="" stroke-dashoffset="0"
+                                font-family="none" font-weight="none" font-size="none" text-anchor="none"
+                                style="mix-blend-mode: normal">
+                                <path d="M0,172v-172h172v172z" fill="none"></path>
+                                <g fill="#ffffff">
+                                    <path
+                                        d="M39.69231,0c-10.95673,0 -19.84615,8.88942 -19.84615,19.84615v132.30769c0,10.95673 8.88942,19.84615 19.84615,19.84615h92.61538c10.95673,0 19.84615,-8.88942 19.84615,-19.84615v-34.31731l-13.23077,11.57692v22.74038c0,3.64363 -2.97176,6.61538 -6.61538,6.61538h-92.61538c-3.64363,0 -6.61538,-2.97176 -6.61538,-6.61538v-132.30769c0,-3.64363 2.97176,-6.61538 6.61538,-6.61538h92.61538c3.64363,0 6.61538,2.97176 6.61538,6.61538v22.74038l13.23077,11.57692v-34.31731c0,-10.95673 -8.88942,-19.84615 -19.84615,-19.84615zM109.15385,42.79327c-1.65385,0.49099 -3.30769,2.17067 -3.30769,6.61538v16.74519h-39.69231c-3.64363,0 -6.61538,2.97176 -6.61538,6.61538v26.46154c0,3.64363 2.97176,6.61538 6.61538,6.61538h39.69231v16.53846c0,8.47596 6.61538,6.61538 6.61538,6.61538l49.61538,-43l-49.61538,-43c0,0 -1.65385,-0.69772 -3.30769,-0.20673z">
+                                    </path>
+                                </g>
+                            </g>
+                        </svg><strong> Logout</strong></a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    <h1 style="text-align: center; color: #fff;"><b>Question and Answers</b></h1>
+    <div class="container mt-3" id="content">
+        <div class="row">
+                <div class="col-md-12 text-center">
+                    
+                    <h5 style="text-align: left;"><b>Original Text:</b></h5>
+        <p style="text-align: left;">{{ text }}</p>
+        <h5   style="text-align: left;"><b>Question and Answers:</b></h5>
+        <div style="text-align: left;">
+            {% for item in question %}
+            <div class="question">
+                {{ loop.index }}) Q: {{ item.question }}
+            </div>
+                <div class="answer">
+                    A: {{ item.answer }}
+                </div>
+    
+            {% endfor %}
+        </div>
+
+                </div>
+              
+            </div>
+        
+    </div>
+</body>
+
+</html>
+
+
+index.css
+
+
+:root {
+  --violet: #04010a;
+  --magenta: #7955c9;
+}
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+body {
+  background-color: var(--violet);
+  background-image: url("bg.svg");
+  background-repeat: no-repeat;
+  background-size: contain;
+  height: 100vh;
+  min-height: 100vh;
+  color: white;
+  font-size: 1.4em;
+  line-height: 1.5;
+  font-family: "Poppins", sans-serif;
+}
+body main {
+  margin: 0.5em 0.5em 0 0.5em;
+}
+body main .logo {
+  height: 45px;
+  max-width: 100%;
+}
+body main article {
+  display: flex;
+}
+body main article img {
+  max-width: 100%;
+}
+body main article .content {
+  display: flex;
+  flex: 50%;
+  flex-direction: column;
+  margin-left: 3em;
+}
+body main article .content p {
+  font-size: 17px;
+  color: #eeeeee;
+}
+body main article .content button {
+  margin-top: 1em;
+  padding: 16px 0;
+  font-size: 20px;
+  background-color: white;
+  border-radius: 4px;
+  border: none;
+  outline: none;
+  color: var(--violet);
+  box-shadow: 0 5px 10px 10px rgba(0, 0, 0, 0.123);
+  text-decoration: none;
+  text-align: center;
+  display: inline-block;
+  width: 29%;
+}
+body main article .content button:hover {
+  background-color: var(--magenta);
+  color: white;
+}
+body footer .attribution {
+  font-size: 14px;
+  text-align: center;
+}
+body footer .attribution a {
+  color: #00252e;
+  font-weight: bold;
+  text-decoration: none;
+}
+body footer .attribution i {
+  color: #ec2828;
+}
+@media (max-width: 1024px) {
+  body main {
+    margin: 2em 3em 0 3em;
+  }
+  body main article {
+    margin-top: 1.2em;
+  }
+  body main article .content {
+    flex: 63%;
+  }
+  body main article .content h1 {
+    font-size: 32px;
+  }
+}
+@media (max-width: 768px) {
+  body {
+    background-image: url("bg-m.svg");
+    background-size: cover;
+  }
+  body main {
+    margin: 3em 3em 0 3em;
+  }
+  body main .logo {
+    height: auto;
+  }
+  body main article {
+    margin-top: 4.5em;
+    display: flex;
+    flex-flow: row wrap;
+    justify-content: space-around;
+  }
+  body main article .content {
+    margin-left: 0;
+    margin-top: 4em;
+  }
+  body main article .content h1 {
+    font-size: 50px;
+    text-align: center;
+  }
+  body main article .content p {
+    text-align: center;
+    font-size: 24px;
+    line-height: 2;
+  }
+  body main article .content button {
+    margin-top: 2em;
+    margin-bottom: 5em;
+    width: 60%;
+    margin-left: 20%;
+  }
+  body main .SocialMedia {
+    justify-content: center;
+  }
+  body footer {
+    margin-top: 1em;
+  }
+  .fadein {
+    position: relative;
+    width: 250px;
+    height: 232px;
+  }
+  .fadein img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform: translateY(-70px);
+  }
+}
+@media (max-width: 425px) {
+  body {
+    background-size: 100% auto;
+  }
+  body main {
+    margin: 2em 2em 0 2em;
+  }
+  body main .logo {
+    height: 36px;
+  }
+  body main article {
+    margin-top: 2em;
+  }
+  body main article .content {
+    margin-top: 2em;
+  }
+  body main article .content h1 {
+    font-size: 26px;
+  }
+  body main article .content p {
+    font-size: 16.5px;
+  }
+  body main article .content button {
+    width: 70%;
+    margin-left: 15%;
+  }
+  body main .SocialMedia {
+    justify-content: center;
+  }
+  body footer {
+    margin-top: 1em;
+  }
+  .fadein {
+    position: relative;
+    width: 250px;
+    height: 232px;
+  }
+  .fadein img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform: translateY(-70px);
+  }
+}
+.fadein {
+  position: relative;
+  width: 450px;
+  height: 332px;
+}
+.fadein img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translateY(-70px);
+}
+
+quiz.css
+
+* {
+  box-sizing: border-box;
+  -moz-box-sizing: border-box;
+  -webkit-box-sizing: border-box;
+}
+
+body {
+  font-family: 'Poppins', sans-serif;
+  background-color: #0f0e0f;
+  background-image: url("bg.svg");
+  background-repeat: no-repeat;
+  background-size: contain;
+}
+a {
+  color: #fff;
+}
+a:hover {
+  color: #b9b1b1
+}
+
+.wrapper {
+  margin: auto;
+  max-width: 640px;
+  padding-top: 20px;
+  text-align: center;
+}
+
+.container {
+  background-color: #fff;
+  padding: 20px;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.425);
+}
+
+.upload-container {
+  background-color: rgb(239, 239, 239);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.border-container {
+  border: 5px dashed rgba(198, 198, 198, 0.65);
+  border-radius: 6px;
+  padding: 20px;
+  cursor: pointer;
+}
+
+.border-container p {
+  color: #130f40;
+  font-weight: 600;
+  font-size: 1.1em;
+  letter-spacing: -1px;
+  margin-top: 30px;
+  margin-bottom: 0;
+  opacity: 0.65;
+}
+
+#file-browser {
+  text-decoration: none;
+  color: rgb(22,42,255);
+  border-bottom: 3px dotted rgba(22, 22, 255, 0.85);
+}
+
+#file-browser:hover {
+  color: rgb(0, 0, 255);
+  border-bottom: 3px dotted rgba(0, 0, 255, 0.85);
+}
+.logout {
+  color: #fff;
+}
+.icons {
+  color: #95afc0;
+  opacity: 0.55;
+  transition: all 500ms ease;
+}
+.pdficon {
+  color: red;
+  opacity: 0.90;
+  transition: all 500ms ease;
+}
+.txticon {
+  color: blue;
+  opacity: 0.90;
+  transition: all 500ms ease;
+}
+.icon-text {
+  font-size: 20px !important;
+}
+.submitDoc {
+  color: #ffffff;
+  font-size: 1.2em;
+  padding: 1rem;
+  letter-spacing: 1px;
+  border-radius: 4px;
+  line-height: 1;
+  background-color: #674baf;
+  border: none;
+  cursor: pointer;
+  transition: all 500ms ease;
+}
+.file-label {
+  width: 200px;
+}
+.submitDoc:hover {
+  background-color: #733bff;
+  border-color: #733bff;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+}
+ 
+body footer .attribution {
+  font-size: 14px;
+  text-align: center;
+  color: #fff;
+}
+
+textarea {
+  height:auto;
+  max-width:600px;
+  color:#999;
+  font-weight:400;
+  font-size:20px;
+  font-family:'Ubuntu', Helvetica, Arial, sans-serif;
+  width:100%;
+  background:#fff;
+  border-radius:3px;
+  line-height:2em;
+  border:none;
+  box-shadow:0px 0px 5px 1px rgba(0,0,0,0.1);
+  padding:30px;
+  -webkit-transition: height 2s ease;
+-moz-transition: height 2s ease;
+-ms-transition: height 2s ease;
+-o-transition: height 2s ease;
+transition: height 2s ease;
+}
+
+* {
+  -webkit-font-smoothing:antialiased !important;
+}
+
+
+summary.css
+
+* {
+    box-sizing: border-box;
+    -moz-box-sizing: border-box;
+    -webkit-box-sizing: border-box;
+  }
+  
+  body {
+    font-family: 'Poppins', sans-serif;
+    background-color: #0f0e0f;
+    background-image: url("bg.svg");
+    background-repeat: no-repeat;
+    background-size: contain;
+  }
+  a {
+    color: #fff;
+  }
+  a:hover {
+    color: #b9b1b1
+  }
+  
+  .wrapper {
+    margin: auto;
+    max-width: 640px;
+    padding-top: 20px;
+    text-align: center;
+  }
+  
+  .container {
+    background-color: #fff;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.425);
+  }
+  
+  .upload-container {
+    background-color: rgb(239, 239, 239);
+    border-radius: 6px;
+    padding: 10px;
+  }
+  
+  .border-container {
+    border: 5px dashed rgba(198, 198, 198, 0.65);
+    border-radius: 6px;
+    padding: 20px;
+    cursor: pointer;
+  }
+  
+  .border-container p {
+    color: #130f40;
+    font-weight: 600;
+    font-size: 1.1em;
+    letter-spacing: -1px;
+    margin-top: 30px;
+    margin-bottom: 0;
+    opacity: 0.65;
+  }
+  
+  #file-browser {
+    text-decoration: none;
+    color: rgb(22,42,255);
+    border-bottom: 3px dotted rgba(22, 22, 255, 0.85);
+  }
+  
+  #file-browser:hover {
+    color: rgb(0, 0, 255);
+    border-bottom: 3px dotted rgba(0, 0, 255, 0.85);
+  }
+  .logout {
+    color: #fff;
+  }
+  .icons {
+    color: #95afc0;
+    opacity: 0.55;
+    transition: all 500ms ease;
+  }
+  .pdficon {
+    color: red;
+    opacity: 0.90;
+    transition: all 500ms ease;
+  }
+  .txticon {
+    color: blue;
+    opacity: 0.90;
+    transition: all 500ms ease;
+  }
+  .icon-text {
+    font-size: 20px !important;
+  }
+  .submitDoc {
+    color: #ffffff;
+    font-size: 1.2em;
+    padding: 1rem;
+    letter-spacing: 1px;
+    border-radius: 4px;
+    line-height: 1;
+    background-color: #674baf;
+    border: none;
+    cursor: pointer;
+    transition: all 500ms ease;
+  }
+  .file-label {
+    width: 200px;
+  }
+  .submitDoc:hover {
+    background-color: #733bff;
+    border-color: #733bff;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+  }
+   
+  body footer .attribution {
+    font-size: 14px;
+    text-align: center;
+    color: #fff;
+  }
+  
+  textarea {
+    height:auto;
+    max-width:600px;
+    color:#999;
+    font-weight:400;
+    font-size:20px;
+    font-family:'Ubuntu', Helvetica, Arial, sans-serif;
+    width:100%;
+    background:#fff;
+    border-radius:3px;
+    line-height:2em;
+    border:none;
+    box-shadow:0px 0px 5px 1px rgba(0,0,0,0.1);
+    padding:30px;
+    -webkit-transition: height 2s ease;
+  -moz-transition: height 2s ease;
+  -ms-transition: height 2s ease;
+  -o-transition: height 2s ease;
+  transition: height 2s ease;
+  }
+  
+  * {
+    -webkit-font-smoothing:antialiased !important;
+  }
+  .summ{
+    border: 5px dotted grey;
+    text-align: center;
+    background-color: white;
+    height: 10px;
+
+  }  
+
+upload.css
+
+* {
+  box-sizing: border-box;
+  -moz-box-sizing: border-box;
+  -webkit-box-sizing: border-box;
+}
+
+body {
+  font-family: 'Poppins', sans-serif;
+  background-color: #0f0e0f;
+  background-image: url("bg.svg");
+  background-repeat: no-repeat;
+  background-size: contain;
+}
+a {
+  color: #fff;
+}
+a:hover {
+  color: #b9b1b1
+}
+
+.wrapper {
+  margin: auto;
+  max-width: 640px;
+  padding-top: 20px;
+  text-align: center;
+}
+
+.container {
+  background-color: #fff;
+  padding: 20px;
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.425);
+}
+
+.upload-container {
+  background-color: rgb(239, 239, 239);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.border-container {
+  border: 5px dashed rgba(198, 198, 198, 0.65);
+  border-radius: 6px;
+  padding: 20px;
+  cursor: pointer;
+}
+
+.border-container p {
+  color: #130f40;
+  font-weight: 600;
+  font-size: 1.1em;
+  letter-spacing: -1px;
+  margin-top: 30px;
+  margin-bottom: 0;
+  opacity: 0.65;
+}
+
+#file-browser {
+  text-decoration: none;
+  color: rgb(22,42,255);
+  border-bottom: 3px dotted rgba(22, 22, 255, 0.85);
+}
+
+#file-browser:hover {
+  color: rgb(0, 0, 255);
+  border-bottom: 3px dotted rgba(0, 0, 255, 0.85);
+}
+.logout {
+  color: #fff;
+}
+.icons {
+  color: #95afc0;
+  opacity: 0.55;
+  transition: all 500ms ease;
+}
+.pdficon {
+  color: red;
+  opacity: 0.90;
+  transition: all 500ms ease;
+}
+.txticon {
+  color: blue;
+  opacity: 0.90;
+  transition: all 500ms ease;
+}
+.icon-text {
+  font-size: 20px !important;
+}
+.submitDoc {
+  color: #ffffff;
+  font-size: 1.2em;
+  padding: 1rem;
+  letter-spacing: 1px;
+  border-radius: 4px;
+  line-height: 1;
+  background-color: #674baf;
+  border: none;
+  cursor: pointer;
+  transition: all 500ms ease;
+}
+.file-label {
+  width: 200px;
+}
+.submitDoc:hover {
+  background-color: #733bff;
+  border-color: #733bff;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+}
+ 
+body footer .attribution {
+  font-size: 14px;
+  text-align: center;
+  color: #fff;
+}
+
+textarea {
+  height:auto;
+  max-width:600px;
+  color:#999;
+  font-weight:400;
+  font-size:20px;
+  font-family:'Ubuntu', Helvetica, Arial, sans-serif;
+  width:100%;
+  background:#fff;
+  border-radius:3px;
+  line-height:2em;
+  border:none;
+  box-shadow:0px 0px 5px 1px rgba(0,0,0,0.1);
+  padding:30px;
+  -webkit-transition: height 2s ease;
+-moz-transition: height 2s ease;
+-ms-transition: height 2s ease;
+-o-transition: height 2s ease;
+transition: height 2s ease;
+}
+
+* {
+  -webkit-font-smoothing:antialiased !important;
+}
+
+sigin.css
+
+* {
+  box-sizing: border-box;
+}
+body {
+  font-family: "Poppins", sans-serif;
+  font-size: 14px;
+  color: #bebebe;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  margin: 0;
+  padding: 2.5em;
+  background-color: #6c57a0;
+}
+h1 {
+  font-size: 2.5em;
+  color: #131125;
+  font-weight: 700;
+  margin: 0;
+}
+p {
+  line-height: 180%;
+}
+.login-box {
+  display: flex;
+  width: 75em;
+  height: 85vh;
+  min-height: 60em;
+  border-radius: 20px;
+  background-color: #ffffff;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.425);
+}
+.login-box-formbox, .login-box-quotebox {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1 1 100%;
+  padding: 6em 4em;
+}
+.login-box-quotebox {
+  color: white;
+  background-color: #080216;
+  background-image: url("bg-m.svg");
+  background-repeat: no-repeat;
+  background-size: contain;
+  background-size: 125%;
+  background-repeat: no-repeat;
+  background-position: center left;
+}
+.login-box-signup a {
+  color: #a0a4e3;
+  font-weight: 600;
+  text-decoration: inherit;
+}
+.login-box-signup a:hover, .login-box-signup a:focus {
+  color: #0f1396;
+}
+.login-box-login {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  flex-grow: 1;
+}
+.login-box-login > * {
+  width: 100%;
+  flex-shrink: 0;
+}
+form > div {
+  position: relative;
+  padding: 1.5em 0;
+}
+form > div input {
+  color: #000;
+  width: 100%;
+  padding: 1.5em 2em;
+  border: 1px solid #bebebe;
+  border-radius: 5px;
+}
+form > div input.input-email, form > div input.input-password {
+  background-repeat: no-repeat;
+  background-position: right 1em top 1.25em;
+}
+form > div input.input-email {
+  background-image: url('data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="lightgrey" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><circle cx="12" cy="12" r="4"></circle><path d="M16 12v1.5a2.5 2.5 0 0 0 5 0v-1.5a9 9 0 1 0 -5.5 8.28"></path></svg>');
+}
+form > div input.input-password {
+  background-image: url('data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="lightgrey" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><rect x="5" y="11" width="14" height="10" rx="2"></rect><circle cx="12" cy="16" r="1"></circle><path d="M8 11v-4a4 4 0 0 1 8 0v4"></path></svg>');
+}
+form > div input:focus {
+  outline-color: #674baf;
+  border-color: #674baf;
+}
+form > div label {
+  font-size: 0.85em;
+  position: absolute;
+  top: 1.25em;
+  left: 1.5em;
+  background: #ffffff;
+  padding: 0 0.5em;
+}
+form > div:focus-within label {
+  color: #674baf;
+  font-weight: 600;
+}
+form > div .btn {
+  color: #ffffff;
+  font-size: 1.2em;
+  padding: 1rem;
+  letter-spacing: 1px;
+  line-height: 1;
+  background-color: #674baf;
+  border-color: #674baf;
+  cursor: pointer;
+  transition: all 500ms ease;
+}
+form > div .btn:hover, form > div .btn:focus {
+  background-color: #733bff;
+  border-color: #733bff;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+}
+.alternate-text {
+  display: flex;
+  align-items: center;
+  margin: 1.5em 0;
+  text-align: center;
+}
+.alternate-text::before, .alternate-text::after {
+  content: "";
+  flex: 1;
+  border-bottom: 1px solid #bebebe;
+}
+.alternate-text::before {
+  margin-right: 1em;
+}
+.alternate-text::after {
+  margin-left: 1em;
+}
+.alternate-boxes {
+  display: flex;
+  justify-content: space-between;
+  gap: 1em;
+  margin-top: 1.5em;
+}
+.alternate-box {
+  color: #131125;
+  text-align: center;
+  width: 100%;
+  padding: 1em 1em;
+  border: 1px solid rgba(190, 190, 190, 0.5);
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all 500ms ease;
+}
+.alternate-box svg {
+  transition: transform 500ms ease;
+}
+.alternate-box:hover {
+  border-color: #bebebe;
+  background-color: rgba(190, 190, 190, 0.25);
+}
+.alternate-box:hover svg {
+  transform: scale(1.25);
+}
+.quote-container {
+  padding: 1em 0;
+  position: relative;
+}
+.quote {
+  color: #ffffff;
+  font-size: 7em;
+  font-weight: 600;
+  line-height: 1;
+}
+.quote-small {
+  color: #ebeef7;
+  line-height: 180%;
+  padding: 2em 0 0 6em;
+  position: relative;
+}
+.quote-small::before {
+  content: "";
+  position: absolute;
+  top: 2.75em;
+  left: 1.2em;
+  width: 3em;
+  height: 2px;
+  background-color: rgba(255, 255, 255, 0.25);
+}
+.alert-error {
+  padding: 8px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  margin-bottom: 16px;
+  border: 2px solid darkred;
+  background-color: red;
+  color: white;
+}
+
+singup.css
+
+* {
+    box-sizing: border-box;
+  }
+  body {
+    font-family: "Poppins", sans-serif;
+    font-size: 14px;
+    color: #bebebe;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    margin: 0;
+    padding: 2.5em;
+    background-color: #6c57a0;
+    ;
+  }
+  h1 {
+    font-size: 2.5em;
+    color: #131125;
+    font-weight: 700;
+    margin: 0;
+  }
+  p {
+    line-height: 180%;
+  }
+  .login-box {
+    display: flex;
+    width: 75em;
+    height: 85vh;
+    min-height: 60em;
+    border-radius: 20px;
+    background-color: #ffffff;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.425);
+  }
+  .login-box-formbox, .login-box-quotebox {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    flex: 1 1 100%;
+    padding: 4em 6em;
+  }
+  .login-box-quotebox {
+    color: white;
+    background-color: #060606;
+    background-image: url("bg-m.svg");
+    background-repeat: no-repeat;
+    background-size: contain;
+    background-size: 125%;
+    background-repeat: no-repeat;
+    background-position: center left;
+  }
+  .login-box-signup a {
+    color: #a0a4e3;
+    font-weight: 600;
+    text-decoration: inherit;
+  }
+  .login-box-signup a:hover, .login-box-signup a:focus {
+    color: #0f1396;
+  }
+  .login-box-login {
+    display: flex;
+    flex-wrap: wrap;
+    align-content: center;
+    flex-grow: 1;
+  }
+  .login-box-login > * {
+    width: 100%;
+    flex-shrink: 0;
+  }
+  form > div {
+    position: relative;
+    padding: 1.5em 0;
+  }
+  form > div input {
+    color: #000;
+    width: 100%;
+    padding: 1.5em 2em;
+    border: 1px solid #bebebe;
+    border-radius: 5px;
+  }
+  form > div input.input-email, form > div input.input-password {
+    background-repeat: no-repeat;
+    background-position: right 1em top 1.25em;
+  }
+  form > div input.input-email {
+    background-image: url('data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="lightgrey" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><circle cx="12" cy="12" r="4"></circle><path d="M16 12v1.5a2.5 2.5 0 0 0 5 0v-1.5a9 9 0 1 0 -5.5 8.28"></path></svg>');
+  }
+  form > div input.input-password {
+    background-image: url('data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="lightgrey" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><rect x="5" y="11" width="14" height="10" rx="2"></rect><circle cx="12" cy="16" r="1"></circle><path d="M8 11v-4a4 4 0 0 1 8 0v4"></path></svg>');
+  }
+  form > div input:focus {
+    outline-color: #674baf;
+    border-color: #674baf;
+  }
+  form > div label {
+    font-size: 0.85em;
+    position: absolute;
+    top: 1.25em;
+    left: 1.5em;
+    background: #ffffff;
+    padding: 0 0.5em;
+  }
+  form > div:focus-within label {
+    color: #674baf;
+    font-weight: 600;
+  }
+  form > div .btn {
+    color: #ffffff;
+    font-size: 1.2em;
+    padding: 1rem;
+    letter-spacing: 1px;
+    line-height: 1;
+    background-color: #674baf;
+    border-color: #674baf;
+    cursor: pointer;
+    transition: all 500ms ease;
+  }
+  form > div .btn:hover, form > div .btn:focus {
+    background-color: #733bff;
+    border-color: #733bff;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+  }
+  .alternate-text {
+    display: flex;
+    align-items: center;
+    margin: 1.5em 0;
+    text-align: center;
+  }
+  .alternate-text::before, .alternate-text::after {
+    content: "";
+    flex: 1;
+    border-bottom: 1px solid #bebebe;
+  }
+  .alternate-text::before {
+    margin-right: 1em;
+  }
+  .alternate-text::after {
+    margin-left: 1em;
+  }
+  .alternate-boxes {
+    display: flex;
+    justify-content: space-between;
+    gap: 1em;
+    margin-top: 1.5em;
+  }
+  .alternate-box {
+    color: #131125;
+    text-align: center;
+    width: 100%;
+    padding: 1em 1em;
+    border: 1px solid rgba(190, 190, 190, 0.5);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 500ms ease;
+  }
+  .alternate-box svg {
+    transition: transform 500ms ease;
+  }
+  .alternate-box:hover {
+    border-color: #bebebe;
+    background-color: rgba(190, 190, 190, 0.25);
+  }
+  .alternate-box:hover svg {
+    transform: scale(1.25);
+  }
+  .quote-container {
+    padding: 1em 0;
+    position: relative;
+  }
+  .quote {
+    color: #ffffff;
+    font-size: 7em;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .quote-small {
+    color: #ebeef7;
+    line-height: 180%;
+    padding: 2em 0 0 6em;
+    position: relative;
+  }
+  .quote-small::before {
+    content: "";
+    position: absolute;
+    top: 2.75em;
+    left: 1.2em;
+    width: 3em;
+    height: 2px;
+    background-color: rgba(255, 255, 255, 0.25);
+  }
+  .alert-error {
+    padding: 8px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    margin-bottom: 16px;
+    border: 2px solid darkred;
+    background-color: red;
+    color: white;
+  }
+
+
+
